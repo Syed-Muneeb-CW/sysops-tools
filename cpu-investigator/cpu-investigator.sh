@@ -30,7 +30,7 @@ ok()      { echo "${GRN}[+]${RST} $1"; }
 warn()    { echo "${RED}[!]${RST} $1"; }
 
 APPS_BASE="/home/master/applications"
-VERSION="7.1.0"
+VERSION="7.4.0"
 
 usage() {
     cat <<USAGE
@@ -45,7 +45,8 @@ Usage:
 
 Flags:
   --today | --24h    analyze the last 24 hours (today) without prompting
-  --scan             run 'apm scan' without prompting (read-only malware check)
+  --apm              include the Cloudways APM section without prompting
+  --scan             run 'apm scan' without prompting (implies --apm)
   --version          print version and exit
   -h | --help        this help
 
@@ -69,11 +70,13 @@ ask() {   # ask <prompt> <default>
 TODAY=$(date +%F)
 TARGET_DATE=""
 FORCE_SCAN=0
+FORCE_APM=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)    usage; exit 0 ;;
         --version)    echo "cpu-investigator v${VERSION}"; exit 0 ;;
-        --scan)       FORCE_SCAN=1 ;;
+        --apm)        FORCE_APM=1 ;;
+        --scan)       FORCE_SCAN=1; FORCE_APM=1 ;;
         --today|--24h) TARGET_DATE="$TODAY" ;;
         -*)           warn "Unknown flag: $1"; usage; exit 1 ;;
         *)            TARGET_DATE="$1" ;;
@@ -150,9 +153,26 @@ geo_ip() {
 ###############################################################################
 # 1. Server time
 ###############################################################################
-section "1. SERVER TIME"
+section "1. SERVER TIME & UPTIME"
 date
 note "Target date under investigation: ${BLD}${TARGET_DATE}${RST}$( [ $IS_HISTORIC -eq 1 ] && echo ' (historic — rotated logs included)' )"
+echo
+uptime
+BOOT_TIME=$(uptime -s 2>/dev/null)
+[ -n "$BOOT_TIME" ] && echo "System boot time: $BOOT_TIME"
+REBOOT_LINES=$(last -x reboot shutdown 2>/dev/null | grep -a "$D_SYSLOG")
+REBOOTED=0
+if [ -n "$REBOOT_LINES" ]; then
+    REBOOTED=1
+    warn "Server was REBOOTED/SHUT DOWN on $TARGET_DATE:"
+    echo "$REBOOT_LINES" | sed 's/^/    /'
+    note "The evidence for an outage lives in the minutes BEFORE the reboot — logs and atop after it start fresh."
+elif [ -n "$BOOT_TIME" ] && [ "$(date -d "$BOOT_TIME" +%F 2>/dev/null)" = "$TARGET_DATE" ]; then
+    REBOOTED=1
+    warn "System booted ON the target date ($BOOT_TIME) — earlier logs/atop for this date may predate a crash or reboot."
+else
+    ok "No reboot recorded on $TARGET_DATE (continuous uptime through the investigation window)."
+fi
 
 ###############################################################################
 # 2. PHP version
@@ -202,7 +222,7 @@ BREACH_MINUTES=$(echo "$FPM_HITS" | grep -oaP '^\[\d{2}-\w{3}-\d{4} \K\d{2}:\d{2
 ###############################################################################
 # 4. oom-killer events
 ###############################################################################
-section "4. OOM-KILLER EVENTS ($TARGET_DATE)"
+section "4. OOM-KILLER & KERNEL EVENTS ($TARGET_DATE)"
 OOM_HITS=$( { read_logs /var/log/syslog; read_logs /var/log/kern.log; } 2>/dev/null \
             | grep -ai "oom-killer" | grep -aE "^($D_SYSLOG|$D_ISO)" )
 if [ -n "$OOM_HITS" ]; then
@@ -212,6 +232,17 @@ if [ -n "$OOM_HITS" ]; then
     HOURS=$(printf '%s\n%s\n' "$HOURS" "$OOM_HOURS" | sort -u | sed '/^$/d')
 else
     ok "No oom-killer events found in syslog/kern.log for $TARGET_DATE."
+fi
+
+# Kernel-level distress: distinguishes app overload from kernel/hardware outages
+KERN_ISSUES=$( { read_logs /var/log/syslog; read_logs /var/log/kern.log; } 2>/dev/null \
+    | grep -aiE "kernel panic|soft lockup|hung_task|watchdog: BUG|blocked for more than|Out of memory|EXT4-fs error|I/O error" \
+    | grep -aE "^($D_SYSLOG|$D_ISO)" )
+if [ -n "$KERN_ISSUES" ]; then
+    warn "Kernel/hardware distress events on $TARGET_DATE ($(echo "$KERN_ISSUES" | wc -l) lines) — these can cause outages independent of PHP load:"
+    echo "$KERN_ISSUES" | head -5 | cut -c1-160 | sed 's/^/    /'
+else
+    ok "No kernel panics / lockups / hung tasks / I-O errors logged for $TARGET_DATE."
 fi
 
 if [ -z "$FPM_HITS" ] && [ -z "$OOM_HITS" ]; then
@@ -226,7 +257,7 @@ fi
 # 5. Per-application deep dive
 ###############################################################################
 declare -A SUM_SLOW SUM_REQ SUM_ERR SUM_CRON
-declare -A TOP_MOD TOP_IP TOP_IP_CNT TOP_IP_UA TOP_URI TOP_URI_CNT PHP_TOTSEC HEAVY_MIN SLOWEST_URI SLOWEST_SEC SUSP_IPS
+declare -A TOP_MOD TOP_IP TOP_IP_CNT TOP_IP_UA TOP_URI TOP_URI_CNT PHP_TOTSEC HEAVY_MIN SLOWEST_URI SLOWEST_SEC SUSP_IPS DDOS_SIG
 
 for POOL in $POOLS; do
     APP_LOGS="$APPS_BASE/$POOL/logs"
@@ -356,6 +387,80 @@ for POOL in $POOLS; do
                 done <<< "$TOP3URI"
                 echo "    └────────────────────────────────────────────────────────────────────────"
             done <<< "$(echo "$IP_STATS" | head -5)"
+
+            # ---- DDoS / attack-pattern analysis ------------------------------
+            echo
+            echo "  ${BLD}[DDoS / attack-pattern analysis]${RST}"
+
+            # a) Peak request rate per SECOND (floods live at second granularity)
+            SEC_STATS=$(printf '%s\n' "$ACC_TMP" | awk '{print substr($4,14,8)}' \
+                        | sort | uniq -c | sort -rn)
+            echo "  Peak seconds (req/sec | HH:MM:SS):"
+            echo "$SEC_STATS" | head -3 | sed 's/^/      /'
+            PEAK_RPS=$(echo "$SEC_STATS" | head -1 | awk '{print $1+0}')
+            [ "${PEAK_RPS:-0}" -ge 30 ] && DDOS_SIG[$POOL]="${DDOS_SIG[$POOL]}| burst of ${PEAK_RPS} req/sec "
+
+            # b) Source distribution: unique IPs + subnet concentration
+            UNIQ_IPS=$(printf '%s\n' "$ACC_TMP" | awk '{print $1}' | sort -u | grep -ac .)
+            echo "  Unique client IPs in window: $UNIQ_IPS"
+            echo "  Top source subnets (req | distinct IPs | subnet):"
+            NET_STATS=$(printf '%s\n' "$ACC_TMP" | awk '{
+                    ip = $1
+                    if (ip ~ /:/) { split(ip, a, ":"); net = a[1] ":" a[2] ":" a[3] "::/48" }
+                    else          { split(ip, a, "."); net = a[1] "." a[2] "." a[3] ".0/24" }
+                    print net, ip
+                }' | awk '{
+                    req[$1]++; if (!seen[$1 " " $2]++) ips[$1]++
+                } END { for (k in req) printf "%6d %6d  %s\n", req[k], ips[k], k }' | sort -rn)
+            echo "$NET_STATS" | head -5 | sed 's/^/      /'
+            read -r TN_REQ TN_IPS TN_NET <<< "$(echo "$NET_STATS" | head -1)"
+            if [ "${TN_IPS:-0}" -ge 10 ] && [ "${TN_REQ:-0}" -ge $(( REQ_IN_WIN / 5 )) ]; then
+                DDOS_SIG[$POOL]="${DDOS_SIG[$POOL]}| subnet ${TN_NET}: ${TN_IPS} IPs / ${TN_REQ} req "
+            fi
+
+            # c) Randomized query-string flood ("random filters" cache-buster)
+            echo "  Paths by DISTINCT query strings (uniq-qs | hits | uniq% | path):"
+            QS_STATS=$(printf '%s\n' "$ACC_TMP" | awk -F'"' '{
+                    split($2, r, " "); u = r[2]
+                    q = index(u, "?"); if (q == 0) next
+                    path = substr(u, 1, q - 1); qs = substr(u, q + 1)
+                    hits[path]++
+                    if (!seen[path " " qs]++) dq[path]++
+                } END {
+                    for (p in hits) if (hits[p] >= 10)
+                        printf "%6d %6d %4d  %s\n", dq[p], hits[p], dq[p]*100/hits[p], p
+                }' | sort -rn)
+            if [ -n "$QS_STATS" ]; then
+                echo "$QS_STATS" | head -5 | cut -c1-110 | sed 's/^/      /'
+                read -r QDQ QHITS QPCT QPATH <<< "$(echo "$QS_STATS" | head -1)"
+                if [ "${QPCT:-0}" -ge 80 ] && [ "${QHITS:-0}" -ge 50 ]; then
+                    DDOS_SIG[$POOL]="${DDOS_SIG[$POOL]}| random-query flood on ${QPATH} (${QDQ} unique query strings / ${QHITS} hits) "
+                fi
+            else
+                echo "      none significant (no path with 10+ query-string requests)"
+            fi
+
+            # d) Botnet fingerprint: one UA across many distinct IPs
+            echo "  UAs by distinct IP count (identical UA on many IPs = botnet fingerprint):"
+            UA_IP_STATS=$(printf '%s\n' "$ACC_TMP" | awk -F'"' '{
+                    split($1, a, " "); print a[1] "\t" $6
+                }' | sort -u | awk -F'\t' '{c[$2]++} END {
+                    for (u in c) printf "%6d  %s\n", c[u], substr(u, 1, 80)
+                }' | sort -rn)
+            echo "$UA_IP_STATS" | head -4 | sed 's/^/      /'
+            TOPUA_LINE=$(echo "$UA_IP_STATS" | head -1)
+            TOPUA_IPS=$(echo "$TOPUA_LINE" | awk '{print $1+0}')
+            if [ "${TOPUA_IPS:-0}" -ge 30 ] && ! echo "$TOPUA_LINE" | grep -aqiE 'bot|crawl|spider|slurp'; then
+                DDOS_SIG[$POOL]="${DDOS_SIG[$POOL]}| one UA shared by ${TOPUA_IPS} IPs "
+            fi
+
+            # e) POST flood
+            POSTS=$(printf '%s\n' "$ACC_TMP" | awk -F'"' '{split($2, r, " "); if (r[1] == "POST") print r[2]}')
+            NPOST=$(printf '%s' "$POSTS" | grep -ac .)
+            echo "  POST requests: $NPOST ($(( NPOST * 100 / REQ_IN_WIN ))% of traffic); top POST targets:"
+            printf '%s\n' "$POSTS" | sort | uniq -c | sort -rn | head -3 | cut -c1-110 | sed 's/^/      /'
+            [ "$NPOST" -ge $(( REQ_IN_WIN / 3 )) ] && [ "$NPOST" -ge 100 ] && \
+                DDOS_SIG[$POOL]="${DDOS_SIG[$POOL]}| POST flood: ${NPOST} POSTs "
         fi
 
         # ---- 5b2. php-app.access.log (fpm: duration / memory / %CPU) ---------
@@ -446,6 +551,14 @@ section "6. CLOUDWAYS APM SNAPSHOT"
 if ! command -v apm >/dev/null 2>&1; then
     note "apm tool not found on this server — skipping (install/usage: Cloudways platform servers only)."
 else
+    RUN_APM=$FORCE_APM
+    if [ "$RUN_APM" -eq 0 ]; then
+        APM_ANSW=$(ask "Include Cloudways APM analysis? Adds traffic/MySQL/PHP snapshots but lengthens output [y/N]: " "N")
+        case "$APM_ANSW" in y|Y|yes|YES) RUN_APM=1 ;; esac
+    fi
+    if [ "$RUN_APM" -eq 0 ]; then
+    note "APM analysis skipped — rerun with --apm (or answer y) to include it. Core log + atop analysis is unaffected."
+    else
     # Log-derived stats: meaningful for today AND useful context for past dates
     for POOL in $POOLS; do
         echo
@@ -487,6 +600,7 @@ else
     else
         note "Skipping apm mysql/php/cron: they report CURRENT state only, which cannot explain a spike on $TARGET_DATE."
     fi
+    fi
 fi
 
 ###############################################################################
@@ -513,6 +627,9 @@ else
                   idle = $NF
                   if (tot > 0) printf "    %s   busy %3.0f%%   (idle %3.0f%%)\n", $1, (tot-idle)*100/tot, idle*100/tot
               }')
+        if [ -z "$BUSY_LINES" ]; then
+            warn "  No atop samples in ${HH}:00-${HH}:59 — server was likely DOWN or rebooting during this window."
+        fi
         echo "$BUSY_LINES"
         HB=$(echo "$BUSY_LINES" | grep -oaE 'busy +[0-9]+' | awk '{if ($2+0 > m) m = $2+0} END {print m+0}')
         [ "${HB:-0}" -gt "${MAX_BUSY:-0}" ] && MAX_BUSY=$HB
@@ -560,6 +677,8 @@ section "8. INVESTIGATION SUMMARY — $TARGET_DATE"
                    || ok  "No fpm pool exhaustion."
 [ -n "$OOM_HITS" ] && warn "oom-killer fired $(echo "$OOM_HITS" | wc -l) time(s) — RAM exhausted." \
                    || ok  "No OOM events."
+[ "${REBOOTED:-0}" -eq 1 ] && warn "Server was rebooted on $TARGET_DATE — treat pre-reboot windows as the outage evidence (see section 1)."
+[ -n "$KERN_ISSUES" ] && warn "Kernel/hardware distress events were logged — see section 4; the outage may not be PHP-load related."
 [ -n "$DOMINANT_PROC" ] && note "Dominant CPU process across spike windows (atop): ${BLD}${DOMINANT_PROC}${RST}"
 
 for POOL in $POOLS; do
@@ -590,10 +709,19 @@ for POOL in $POOLS; do
     fi
     echo "   Avg concurrently busy PHP workers in window: ~${AVG_CONC} (bursting far higher at the breach minute)."
     [ -n "${SLOWEST_URI[$POOL]}" ] && echo "   Slowest single request: ${SLOWEST_SEC[$POOL]}s — $(echo "${SLOWEST_URI[$POOL]}" | cut -c1-100)"
+    if [ "${SLOWEST_SEC[$POOL]%%.*}" -ge 300 ] 2>/dev/null; then
+        echo "   ${RED}NO EFFECTIVE PHP TIMEOUT:${RST} requests ran ${SLOWEST_SEC[$POOL]%%.*}s+. Check max_execution_time and"
+        echo "   php-fpm request_terminate_timeout — runaway requests hold workers for MINUTES each."
+    fi
 
     echo
     echo "  ${BLD}Ranked findings:${RST}"
     RANK=0
+
+    if [ -n "${DDOS_SIG[$POOL]}" ]; then
+        RANK=$((RANK+1))
+        echo "   ${RED}${RANK}.${RST} DDoS SIGNATURE detected: ${DDOS_SIG[$POOL]}— front the site with a WAF/CDN (Cloudflare), add nginx rate-limiting, and block the flagged subnets."
+    fi
 
     if [ -n "${SUSP_IPS[$POOL]}" ]; then
         RANK=$((RANK+1))
@@ -601,6 +729,9 @@ for POOL in $POOLS; do
     fi
 
     case "${SLOWEST_URI[$POOL]}" in
+        *_hsenc*|*_hsmi*|*utm_*|*gclid*|*fbclid*)
+            RANK=$((RANK+1))
+            echo "   ${RED}${RANK}.${RST} MARKETING CAMPAIGN CACHE BYPASS: slowest requests carry per-recipient tracking params (_hsenc/utm/gclid) — an email/ad blast where every URL is unique defeats page cache and hits PHP+DB cold. Configure the cache to IGNORE these query params (wp-rocket: 'cache query strings' ignore list / nginx fastcgi_cache_key normalization)." ;;
         *add_to_wishlist*|*add-to-cart*)
             RANK=$((RANK+1))
             echo "   ${RED}${RANK}.${RST} CACHE BYPASS: slowest requests carry query strings (add_to_wishlist/add-to-cart) that skip page cache and hit PHP+DB cold for ${SLOWEST_SEC[$POOL]}s. Fix wishlist/cart plugin to use AJAX, or strip/redirect these query strings." ;;
@@ -652,7 +783,8 @@ echo "  1. Fix the biggest offender in 'Ranked findings' first, then re-measure.
 echo "  2. DATABASE-BOUND? Take the query from 7B / apm --slow_queries, EXPLAIN it, add the missing index."
 echo "  3. AJAX/API FLOOD? Throttle or cache the endpoint (plugin settings / nginx rate-limit / block heavy IP)."
 echo "  4. CACHE BYPASS? Stop wishlist/cart/UTM query strings from bypassing page cache."
-echo "  5. Re-run this script after each change and compare 'Total PHP time consumed'."
+echo "  5. DDoS SIGNATURE? WAF/CDN in front, nginx limit_req on the flooded path, firewall the subnets."
+echo "  6. Re-run this script after each change and compare 'Total PHP time consumed'."
 hr
 ok "Investigation complete. This script made no changes to the server (read-only)."
 hr
