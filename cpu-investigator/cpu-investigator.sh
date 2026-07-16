@@ -30,19 +30,64 @@ ok()      { echo "${GRN}[+]${RST} $1"; }
 warn()    { echo "${RED}[!]${RST} $1"; }
 
 APPS_BASE="/home/master/applications"
+VERSION="7.1.0"
+
+usage() {
+    cat <<USAGE
+cpu-investigator v${VERSION} — read-only CPU spike investigation (Cloudways stacks)
+
+Usage:
+  ./cpu-investigator.sh                    interactive (today or a past date)
+  ./cpu-investigator.sh 2026-07-13         analyze a specific past date
+  ./cpu-investigator.sh --today --scan     non-interactive, include apm scan
+  curl -fsSL <raw-url> | bash -s -- --today          (curl|bash safe)
+  curl -fsSL <raw-url> | bash -s -- 2026-07-13 --scan
+
+Flags:
+  --today | --24h    analyze the last 24 hours (today) without prompting
+  --scan             run 'apm scan' without prompting (read-only malware check)
+  --version          print version and exit
+  -h | --help        this help
+
+The script never writes, modifies, restarts, or reconfigures anything.
+USAGE
+}
+
+# Prompt helper safe for 'curl | bash' (stdin = the script itself there).
+# Reads from the real terminal if one exists; otherwise returns the default.
+ask() {   # ask <prompt> <default>
+    local ans=""
+    if { : < /dev/tty; } 2>/dev/null; then     # tty exists AND is openable
+        read -rp "$1" ans < /dev/tty || ans=""
+    fi
+    echo "${ans:-$2}"
+}
 
 ###############################################################################
 # 0. Target date selection
 ###############################################################################
 TODAY=$(date +%F)
-TARGET_DATE="$1"
+TARGET_DATE=""
+FORCE_SCAN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)    usage; exit 0 ;;
+        --version)    echo "cpu-investigator v${VERSION}"; exit 0 ;;
+        --scan)       FORCE_SCAN=1 ;;
+        --today|--24h) TARGET_DATE="$TODAY" ;;
+        -*)           warn "Unknown flag: $1"; usage; exit 1 ;;
+        *)            TARGET_DATE="$1" ;;
+    esac
+    shift
+done
+
 if [ -z "$TARGET_DATE" ]; then
-    echo "${BLD}Server CPU Spike Investigator (read-only)${RST}"
+    echo "${BLD}Server CPU Spike Investigator v${VERSION} (read-only)${RST}"
     echo
-    read -rp "Analyze last 24 hours (today)? [Y/n, or enter a past date YYYY-MM-DD]: " ANSW
+    ANSW=$(ask "Analyze last 24 hours (today)? [Y/n, or enter a past date YYYY-MM-DD]: " "Y")
     case "$ANSW" in
-        ""|y|Y|yes|YES|24|24h|24H) TARGET_DATE="$TODAY" ;;
-        n|N|no|NO) read -rp "Enter date to analyze (YYYY-MM-DD): " TARGET_DATE ;;
+        y|Y|yes|YES|24|24h|24H) TARGET_DATE="$TODAY" ;;
+        n|N|no|NO) TARGET_DATE=$(ask "Enter date to analyze (YYYY-MM-DD): " "$TODAY") ;;
         *) TARGET_DATE="$ANSW" ;;
     esac
 fi
@@ -115,7 +160,7 @@ note "Target date under investigation: ${BLD}${TARGET_DATE}${RST}$( [ $IS_HISTOR
 section "2. PHP VERSION"
 if ! command -v php >/dev/null 2>&1; then
     warn "php binary not found in PATH."
-    read -rp "Enter PHP version manually (e.g. 8.3): " PHP_VER
+    PHP_VER=$(ask "Enter PHP version manually (e.g. 8.3): " "")
 else
     php -v | head -n 1
     PHP_VER=$(php -v 2>/dev/null | head -n1 | grep -oaP 'PHP \K[0-9]+\.[0-9]+')
@@ -171,7 +216,7 @@ fi
 
 if [ -z "$FPM_HITS" ] && [ -z "$OOM_HITS" ]; then
     note "Nothing breached on $TARGET_DATE."
-    read -rp "Enter an hour to inspect anyway (00-23, or Enter to exit): " MANUAL_HOUR
+    MANUAL_HOUR=$(ask "Enter an hour to inspect anyway (00-23, or Enter to exit): " "")
     [ -z "$MANUAL_HOUR" ] && { echo; ok "Server looks clean for $TARGET_DATE. Done."; exit 0; }
     HOURS="$MANUAL_HOUR"
     POOLS=$(ls "$APPS_BASE" 2>/dev/null)
@@ -428,7 +473,11 @@ else
         done
 
         echo
-        read -rp "Run 'apm scan' for suspicious files? Can take a while but helps rule out malware as the CPU cause [y/N]: " SCAN_ANSW
+        if [ "$FORCE_SCAN" -eq 1 ]; then
+            SCAN_ANSW="y"
+        else
+            SCAN_ANSW=$(ask "Run 'apm scan' for suspicious files? Can take a while but helps rule out malware as the CPU cause [y/N]: " "N")
+        fi
         case "$SCAN_ANSW" in
             y|Y|yes|YES)
                 echo "  ${BLD}[apm scan]${RST} scanning (read-only)..."
